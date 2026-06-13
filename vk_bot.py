@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import random
 import time
@@ -31,6 +32,65 @@ class RateLimiter:
         self._timestamps.append(time.monotonic())
 
 
+# ------------------------------------------------------------------ #
+#  VK Keyboard builders                                               #
+# ------------------------------------------------------------------ #
+
+
+def _btn(label: str, color: str = "primary", payload: dict | None = None) -> dict:
+    b = {
+        "action": {
+            "type": "text",
+            "label": label,
+            "payload": json.dumps(payload or {}, ensure_ascii=False),
+        },
+        "color": color,
+    }
+    return b
+
+
+def build_main_menu() -> str:
+    kb = {
+        "one_time": False,
+        "inline": False,
+        "buttons": [
+            [
+                _btn("📋 Список чатов", "primary", {"cmd": "chats"}),
+            ],
+            [
+                _btn("🔔 Вкл все", "positive", {"cmd": "all_on"}),
+                _btn("🔕 Выкл все", "negative", {"cmd": "all_off"}),
+            ],
+            [
+                _btn("⚙️ Настройки", "secondary", {"cmd": "settings"}),
+                _btn("❓ Помощь", "secondary", {"cmd": "help"}),
+            ],
+        ],
+    }
+    return json.dumps(kb, ensure_ascii=False)
+
+
+def build_chats_keyboard(chat_ids: list[int], current_page: int = 0) -> str:
+    rows = []
+    for cid in chat_ids:
+        rows.append([_btn(f"#{cid}", "secondary", {"cmd": "toggle", "chat_id": cid})])
+    nav = []
+    if current_page > 0:
+        nav.append(_btn("◀️ Назад", "secondary", {"cmd": "chats_page", "page": current_page - 1}))
+    nav.append(_btn("📋 Главное меню", "primary", {"cmd": "menu"}))
+    if len(chat_ids) == 6:
+        nav.append(_btn("▶️ Далее", "secondary", {"cmd": "chats_page", "page": current_page + 1}))
+    if nav:
+        rows.append(nav)
+    kb = {"one_time": False, "inline": False, "buttons": rows}
+    return json.dumps(kb, ensure_ascii=False)
+
+
+# ------------------------------------------------------------------ #
+#  VKBot                                                               #
+# ------------------------------------------------------------------ #
+
+
 class VKBot:
     def __init__(self):
         self.token = cfg.vk_token
@@ -38,6 +98,7 @@ class VKBot:
         self.target_user = cfg.vk_target_user_id
         self._on_reply = None
         self._on_command = None
+        self._on_menu_cmd = None
         self._session: aiohttp.ClientSession | None = None
         self._rate_limiter = RateLimiter()
         self._running = False
@@ -47,6 +108,9 @@ class VKBot:
 
     def set_command_handler(self, fn):
         self._on_command = fn
+
+    def set_menu_handler(self, fn):
+        self._on_menu_cmd = fn
 
     async def _api(self, method: str, **params) -> dict | list | int | None:
         params.update({"access_token": self.token, "v": VK_VERSION})
@@ -69,12 +133,12 @@ class VKBot:
             if "error" in data:
                 err = data["error"]
                 code = err.get("error_code", 0)
-                if code == 6:  # Too many requests
+                if code == 6:
                     delay = min(BASE_DELAY * (2 ** attempt) + random.uniform(0, 1), MAX_DELAY)
                     logger.warning("VK rate limited on %s, retry in %.1fs", method, delay)
                     await asyncio.sleep(delay)
                     continue
-                if code == 14:  # Captcha needed
+                if code == 14:
                     logger.error("VK captcha required for %s", method)
                     return None
                 logger.error("VK API error %s: code=%d msg=%s", method, code, err.get("error_msg", ""))
@@ -85,7 +149,9 @@ class VKBot:
         logger.error("VK API %s failed after %d retries: %s", method, MAX_RETRIES, last_error)
         return None
 
-    async def send_message(self, text: str, attachment: str | None = None) -> int:
+    async def send_message(
+        self, text: str, attachment: str | None = None, keyboard: str | None = None
+    ) -> int:
         params = {
             "user_id": self.target_user,
             "message": text or "\u2014",
@@ -93,6 +159,27 @@ class VKBot:
         }
         if attachment:
             params["attachment"] = attachment
+        if keyboard:
+            params["keyboard"] = keyboard
+        resp = await self._api("messages.send", **params)
+        if isinstance(resp, int):
+            return resp
+        if isinstance(resp, dict):
+            return resp.get("message_id") or resp.get("peer_id", 0)
+        if isinstance(resp, list):
+            return resp[0] if resp else 0
+        return 0
+
+    async def send_with_menu(self, text: str) -> int:
+        return await self.send_message(text, keyboard=build_main_menu())
+
+    async def reply_with_menu(self, text: str, reply_to: int) -> int:
+        params = {
+            "user_id": self.target_user,
+            "message": text or "\u2014",
+            "random_id": int(time.time() * 1_000_000) + random.randint(0, 9999),
+            "keyboard": build_main_menu(),
+        }
         resp = await self._api("messages.send", **params)
         if isinstance(resp, int):
             return resp
@@ -145,9 +232,7 @@ class VKBot:
             logger.error("VK doc upload failed: %s", e)
             return await self.send_message(f"[{filename}] {caption}")
 
-        saved = await self._api(
-            "docs.save", file=uploaded["file"]
-        )
+        saved = await self._api("docs.save", file=uploaded["file"])
         if not saved:
             return await self.send_message(f"[{filename}] {caption}")
 
@@ -227,7 +312,7 @@ class VKBot:
         msg_id = obj["id"]
         text = obj.get("text", "")
         from_id = obj.get("from_id", 0)
-        peer_id = obj.get("peer_id", 0)
+        payload_raw = obj.get("payload", "")
         reply_to = obj.get("reply_message")
 
         try:
@@ -239,6 +324,17 @@ class VKBot:
             logger.debug("Ignored VK message from_id=%s", from_id)
             return
 
+        # --- Decode payload from keyboard buttons ---
+        payload: dict = {}
+        if payload_raw:
+            try:
+                payload = json.loads(payload_raw)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        cmd_from_payload = payload.get("cmd") if isinstance(payload, dict) else None
+
+        # Reply-to (проверяем ДО всего)
         if reply_to and self._on_reply:
             replied_vk_id = reply_to["id"]
             attachments = obj.get("attachments", [])
@@ -246,6 +342,33 @@ class VKBot:
             await self._on_reply(replied_vk_id, text, attachments, msg_id)
             return
 
+        # Menu command from payload (кнопка)
+        if cmd_from_payload and self._on_menu_cmd:
+            await self._on_menu_cmd(cmd_from_payload, payload, msg_id)
+            return
+
+        # Menu command from text (если пользователь написал текст кнопки вручную)
+        menu_keywords = {
+            "меню": "menu",
+            "главное меню": "menu",
+            "📋 список чатов": "chats",
+            "список чатов": "chats",
+            "чаты": "chats",
+            "🔔 вкл все": "all_on",
+            "вкл все": "all_on",
+            "🔕 выкл все": "all_off",
+            "выкл все": "all_off",
+            "⚙️ настройки": "settings",
+            "настройки": "settings",
+            "❓ помощь": "help",
+            "помощь": "help",
+        }
+        text_lower = text.strip().lower()
+        if text_lower in menu_keywords and self._on_menu_cmd:
+            await self._on_menu_cmd(menu_keywords[text_lower], {}, msg_id)
+            return
+
+        # Команды (/...)
         if text.startswith("/"):
             parts = text.split(maxsplit=1)
             cmd = parts[0].lower()
@@ -254,9 +377,9 @@ class VKBot:
                 await self._on_command(cmd, args, msg_id)
             return
 
-        await self.send_message(
+        await self.send_with_menu(
             "Чтобы ответить в Telegram, используй reply на сообщение.\n"
-            "Команды: /send @username, /contacts"
+            "Доступные команды: /send @username, /contacts, /menu"
         )
 
     async def start(self):

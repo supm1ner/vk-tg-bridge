@@ -15,6 +15,8 @@ from storage import (
     init_db, close_db,
     save_mapping, get_tg_by_vk, get_vk_by_tg,
     save_contact, get_contacts,
+    save_chat, toggle_chat, toggle_all_chats,
+    get_all_chat_settings, is_chat_enabled, update_chat_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,7 +39,9 @@ class Bridge:
         self.tg.set_edit_handler(self._on_tg_edit)
         self.vk.set_reply_handler(self._on_vk_reply)
         self.vk.set_command_handler(self._on_vk_command)
+        self.vk.set_menu_handler(self._on_vk_menu)
         self._main_task = asyncio.create_task(self._queue_worker())
+        await self.vk.send_with_menu("Мост запущен. Используй меню для управления.")
 
     async def _queue_worker(self):
         while True:
@@ -56,7 +60,7 @@ class Bridge:
     #  Filters                                                             #
     # ------------------------------------------------------------------ #
 
-    def _is_chat_allowed(self, chat) -> bool:
+    async def _is_chat_allowed(self, chat) -> bool:
         is_channel = isinstance(chat, Channel) and chat.broadcast
         is_dm = isinstance(chat, User)
         is_group = isinstance(chat, (Chat, Channel)) and not is_channel
@@ -75,6 +79,9 @@ class Bridge:
         if chat_id in cfg.chat_filters_blacklist:
             return False
 
+        if not await is_chat_enabled(chat_id):
+            return False
+
         return True
 
     # ------------------------------------------------------------------ #
@@ -83,7 +90,7 @@ class Bridge:
 
     async def _on_tg_message(self, event):
         chat = await event.get_chat()
-        if not self._is_chat_allowed(chat):
+        if not await self._is_chat_allowed(chat):
             return
         msg = event.message
 
@@ -95,7 +102,7 @@ class Bridge:
 
     async def _on_tg_edit(self, event):
         chat = await event.get_chat()
-        if not self._is_chat_allowed(chat):
+        if not await self._is_chat_allowed(chat):
             return
         msg = event.message
         await self._enqueue(self._forward_edit(msg, chat))
@@ -192,6 +199,9 @@ class Bridge:
                     is_channel=is_channel,
                 )
                 logger.info("TG->VK: msg %s -> VK msg %s (chat %s)", msg.id, vk_msg_id, chat_id)
+
+                await save_chat(chat_id, chat_name)
+                await update_chat_name(chat_id, chat_name)
 
                 if isinstance(chat, User) and sender:
                     uname = _entity_username(sender) or str(sender.id)
@@ -362,6 +372,94 @@ class Bridge:
         return None, "\n[фото]"
 
     # ------------------------------------------------------------------ #
+    #  VK Menu (кнопки и payload)                                          #
+    # ------------------------------------------------------------------ #
+
+    async def _on_vk_menu(self, cmd: str, payload: dict, vk_msg_id: int):
+        if cmd == "menu":
+            await self.vk.send_with_menu("Главное меню:")
+        elif cmd == "chats":
+            await self._menu_chats()
+        elif cmd == "chats_page":
+            await self._menu_chats_page(payload.get("page", 0))
+        elif cmd == "toggle":
+            tg_chat_id = payload.get("chat_id")
+            if tg_chat_id:
+                await self._cmd_toggle_id(tg_chat_id)
+        elif cmd == "all_on":
+            await toggle_all_chats(True)
+            await self.vk.send_with_menu("🔔 Пересылка включена для всех чатов.")
+        elif cmd == "all_off":
+            await toggle_all_chats(False)
+            await self.vk.send_with_menu("🔕 Пересылка выключена для всех чатов.")
+        elif cmd == "settings":
+            await self._menu_settings()
+        elif cmd == "help":
+            await self._menu_help()
+
+    async def _menu_chats(self):
+        settings = await get_all_chat_settings()
+        if not settings:
+            await self.vk.send_with_menu("Нет сохранённых чатов. Они появятся после первых сообщений.")
+            return
+
+        lines = ["📋 Чаты (нажми кнопку чтобы переключить):\n"]
+        for i, (tg_id, name, enabled) in enumerate(settings, 1):
+            icon = "✅" if enabled else "❌"
+            lines.append(f"{icon} {name} (id: {tg_id})")
+
+        await self.vk.send_message("\n".join(lines))
+
+    async def _menu_chats_page(self, page: int):
+        settings = await get_all_chat_settings()
+        if not settings:
+            await self.vk.send_with_menu("Нет сохранённых чатов.")
+            return
+
+        per_page = 6
+        start = page * per_page
+        chunk = settings[start:start + per_page]
+        if not chunk:
+            await self.vk.send_with_menu("Чaтов больше нет.")
+            return
+
+        lines = [f"📋 Чаты (стр. {page + 1}):\n"]
+        for tg_id, name, enabled in chunk:
+            icon = "✅" if enabled else "❌"
+            lines.append(f"{icon} {name} (id: {tg_id})")
+        lines.append(f"\nстр. {page + 1}/{max(1, (len(settings) + per_page - 1) // per_page)}")
+
+    async def _menu_settings(self):
+        total = await get_all_chat_settings()
+        enabled = sum(1 for s in total if s[2]) if total else 0
+        all_count = len(total)
+        await self.vk.send_with_menu(
+            "⚙️ Настройки:\n\n"
+            f"📊 Всего чатов: {all_count}\n"
+            f"🔔 Включено: {enabled}\n"
+            f"🔕 Выключено: {all_count - enabled}\n\n"
+            f"TG: {cfg.tg_session}\n"
+            f"Очередь: {self._queue.qsize()}/{self._queue.maxsize}\n\n"
+            "Используй меню для управления."
+        )
+
+    async def _menu_help(self):
+        await self.vk.send_with_menu(
+            "❓ Помощь\n\n"
+            "📋 Список чатов — показать все чаты с настройками\n"
+            "🔔 Вкл все — включить пересылку из всех чатов\n"
+            "🔕 Выкл все — выключить пересылку из всех чатов\n"
+            "⚙️ Настройки — статистика\n\n"
+            "Команды:\n"
+            "/send @username текст — написать в TG\n"
+            "/t <id> — переключить чат по ID\n"
+            "/contacts — список контактов\n"
+            "/menu — показать меню\n"
+            "/status — статус\n"
+            "/ping — проверка"
+        )
+
+    # ------------------------------------------------------------------ #
     #  VK Commands                                                         #
     # ------------------------------------------------------------------ #
 
@@ -371,47 +469,48 @@ class Bridge:
         elif cmd in ("/contacts", "/contact"):
             await self._cmd_contacts()
         elif cmd == "/help":
-            await self._cmd_help()
+            await self._menu_help()
         elif cmd == "/status":
             await self._cmd_status()
         elif cmd == "/chats":
-            await self._cmd_chats()
+            await self._menu_chats()
+        elif cmd == "/menu":
+            await self.vk.send_with_menu("Главное меню:")
         elif cmd == "/ping":
             await self.vk.send_message("pong")
+        elif cmd in ("/t", "/toggle"):
+            await self._cmd_toggle(args)
+        elif cmd in ("/all_on", "/enable_all"):
+            await toggle_all_chats(True)
+            await self.vk.send_with_menu("🔔 Пересылка включена для всех чатов.")
+        elif cmd in ("/all_off", "/disable_all"):
+            await toggle_all_chats(False)
+            await self.vk.send_with_menu("🔕 Пересылка выключена для всех чатов.")
         else:
-            await self._cmd_help()
+            await self._menu_help()
 
-    async def _cmd_help(self):
-        await self.vk.send_message(
-            "Доступные команды:\n"
-            "/send @username текст — написать в TG\n"
-            "/contacts — список контактов\n"
-            "/chats — список последних чатов\n"
-            "/status — статус бота\n"
-            "/ping — проверка связи\n"
-            "/help — эта справка\n\n"
-            "Чтобы ответить в TG, используй reply на сообщение."
-        )
+    async def _cmd_toggle(self, args: str):
+        try:
+            tg_chat_id = int(args.strip())
+            await self._cmd_toggle_id(tg_chat_id)
+        except ValueError:
+            await self.vk.send_message("Использование: /t <id чата>. ID можно узнать через /chats")
+
+    async def _cmd_toggle_id(self, tg_chat_id: int):
+        new_state = await toggle_chat(tg_chat_id)
+        icon = "🔔" if new_state else "🔕"
+        await self.vk.send_with_menu(f"{icon} Чат {tg_chat_id} — {'включён' if new_state else 'выключен'}.")
 
     async def _cmd_status(self):
+        total = await get_all_chat_settings()
+        enabled = sum(1 for s in total if s[2]) if total else 0
         await self.vk.send_message(
-            "Статус: работает\n"
+            "📊 Статус:\n"
             f"TG: {cfg.tg_session}\n"
-            f"VK: группа {cfg.vk_group_id}\n"
+            f"VK группа: {cfg.vk_group_id}\n"
+            f"Чаты: {enabled}/{len(total)} вкл\n"
             f"Очередь: {self._queue.qsize()}/{self._queue.maxsize}"
         )
-
-    async def _cmd_chats(self):
-        try:
-            dialogs = await self.tg.get_dialogs(limit=15)
-            lines = ["Последние чаты:"]
-            for d in dialogs:
-                name = d.name or "?"
-                chat_id = d.entity.id if hasattr(d.entity, "id") else "?"
-                lines.append(f"• {name} (id: {chat_id})")
-            await self.vk.send_message("\n".join(lines))
-        except Exception as e:
-            await self.vk.send_message(f"Ошибка: {e}")
 
     async def _cmd_send(self, args: str, vk_msg_id: int):
         parts = args.split(maxsplit=1)

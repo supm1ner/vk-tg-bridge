@@ -59,6 +59,12 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS schema_version (
             version INTEGER PRIMARY KEY
         );
+
+        CREATE TABLE IF NOT EXISTS chat_settings (
+            tg_chat_id  INTEGER PRIMARY KEY,
+            chat_name   TEXT NOT NULL,
+            enabled     INTEGER DEFAULT 1
+        );
     """)
     await db.commit()
     logger.info("Database initialized: %s", cfg.db_path)
@@ -140,5 +146,79 @@ async def update_media_group_vk_msg(tg_chat_id: int, tg_msg_id: int, vk_msg_id: 
     await db.execute(
         "UPDATE media_groups SET vk_msg_id=? WHERE tg_chat_id=? AND tg_msg_id=?",
         (vk_msg_id, tg_chat_id, tg_msg_id),
+    )
+    await db.commit()
+
+
+# ------------------------------------------------------------------ #
+#  Chat settings (per-chat notification toggle)                        #
+# ------------------------------------------------------------------ #
+
+
+async def save_chat(tg_chat_id: int, chat_name: str, enabled: bool = True):
+    """Вставить чат в настройки, если ещё нет."""
+    db = await get_db()
+    await db.execute(
+        "INSERT OR IGNORE INTO chat_settings (tg_chat_id, chat_name, enabled) VALUES (?,?,?)",
+        (tg_chat_id, chat_name, int(enabled)),
+    )
+    await db.commit()
+
+
+async def get_chat_setting(tg_chat_id: int) -> tuple | None:
+    """(tg_chat_id, chat_name, enabled) или None."""
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT tg_chat_id, chat_name, enabled FROM chat_settings WHERE tg_chat_id=?",
+        (tg_chat_id,),
+    )
+    return await cur.fetchone()
+
+
+async def get_all_chat_settings() -> list[tuple]:
+    """[(tg_chat_id, chat_name, enabled), ...]."""
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT tg_chat_id, chat_name, enabled FROM chat_settings ORDER BY chat_name"
+    )
+    return await cur.fetchall()
+
+
+async def toggle_chat(tg_chat_id: int) -> bool:
+    """Переключить enabled/disabled. Вернуть новое состояние."""
+    db = await get_db()
+    await db.execute(
+        "UPDATE chat_settings SET enabled = CASE WHEN enabled THEN 0 ELSE 1 END WHERE tg_chat_id=?",
+        (tg_chat_id,),
+    )
+    await db.commit()
+    cur = await db.execute(
+        "SELECT enabled FROM chat_settings WHERE tg_chat_id=?", (tg_chat_id,)
+    )
+    row = await cur.fetchone()
+    return bool(row[0]) if row else True
+
+
+async def toggle_all_chats(enabled: bool):
+    """Включить / выключить все чаты разом."""
+    db = await get_db()
+    await db.execute("UPDATE chat_settings SET enabled=?", (int(enabled),))
+    await db.commit()
+
+
+async def is_chat_enabled(tg_chat_id: int) -> bool:
+    """Проверить, включена ли пересылка для чата (по умолч. True)."""
+    row = await get_chat_setting(tg_chat_id)
+    if row is None:
+        return True
+    return bool(row[2])
+
+
+async def update_chat_name(tg_chat_id: int, chat_name: str):
+    """Обновить имя чата (если оно изменилось)."""
+    db = await get_db()
+    await db.execute(
+        "UPDATE chat_settings SET chat_name=? WHERE tg_chat_id=?",
+        (chat_name, tg_chat_id),
     )
     await db.commit()
