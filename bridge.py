@@ -1,87 +1,189 @@
-"""
-Логика моста: связывает TGClient и VKBot.
-"""
-import logging
 import asyncio
 import io
+import logging
+
 import aiohttp
 from telethon.tl.types import (
     User, Channel, Chat,
-    MessageMediaPhoto, MessageMediaDocument, MessageMediaWebPage
+    MessageMediaPhoto, MessageMediaDocument, MessageMediaWebPage,
+    MessageMediaGeo, MessageMediaPoll,
 )
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, RPCError
 
-from storage import init_db, save_mapping, get_tg_by_vk, save_contact, get_contacts
+from config import cfg
+from storage import (
+    init_db, close_db,
+    save_mapping, get_tg_by_vk, get_vk_by_tg,
+    save_contact, get_contacts,
+)
 
 logger = logging.getLogger(__name__)
+
+MEDIA_GROUP_FLUSH_DELAY = 1.0
 
 
 class Bridge:
     def __init__(self, tg: "TGClient", vk: "VKBot"):
         self.tg = tg
         self.vk = vk
+        self._queue: asyncio.Queue = asyncio.Queue(maxsize=cfg.bridge_queue_size)
+        self._media_group_buffers: dict[str, list] = {}
+        self._media_group_tasks: dict[str, asyncio.Task] = {}
+        self._main_task: asyncio.Task | None = None
 
     async def setup(self):
         await init_db()
         self.tg.set_message_handler(self._on_tg_message)
+        self.tg.set_edit_handler(self._on_tg_edit)
         self.vk.set_reply_handler(self._on_vk_reply)
         self.vk.set_command_handler(self._on_vk_command)
+        self._main_task = asyncio.create_task(self._queue_worker())
+
+    async def _queue_worker(self):
+        while True:
+            try:
+                msg = await self._queue.get()
+                await msg
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Queue worker error: %s", e, exc_info=True)
+
+    async def _enqueue(self, coro):
+        await self._queue.put(coro)
+
+    # ------------------------------------------------------------------ #
+    #  Filters                                                             #
+    # ------------------------------------------------------------------ #
+
+    def _is_chat_allowed(self, chat) -> bool:
+        is_channel = isinstance(chat, Channel) and chat.broadcast
+        is_dm = isinstance(chat, User)
+        is_group = isinstance(chat, (Chat, Channel)) and not is_channel
+
+        if not is_dm and not cfg.forward_groups:
+            return False
+        if is_dm and not cfg.forward_dms:
+            return False
+        if is_channel and not cfg.forward_channels:
+            return False
+
+        chat_id = chat.id if hasattr(chat, "id") else 0
+
+        if cfg.chat_filters_whitelist and chat_id not in cfg.chat_filters_whitelist:
+            return False
+        if chat_id in cfg.chat_filters_blacklist:
+            return False
+
+        return True
 
     # ------------------------------------------------------------------ #
     #  Telegram -> VK                                                      #
     # ------------------------------------------------------------------ #
 
     async def _on_tg_message(self, event):
-        """Новое входящее сообщение в Telegram — пересылаем в VK."""
+        chat = await event.get_chat()
+        if not self._is_chat_allowed(chat):
+            return
+        msg = event.message
+
+        if msg.grouped_id:
+            await self._buffer_media_group(msg, chat)
+            return
+
+        await self._enqueue(self._forward_single(msg, chat))
+
+    async def _on_tg_edit(self, event):
+        chat = await event.get_chat()
+        if not self._is_chat_allowed(chat):
+            return
+        msg = event.message
+        await self._enqueue(self._forward_edit(msg, chat))
+
+    async def _buffer_media_group(self, msg, chat):
+        group_id = str(msg.grouped_id)
+        if group_id not in self._media_group_buffers:
+            self._media_group_buffers[group_id] = []
+            self._media_group_tasks[group_id] = asyncio.create_task(
+                self._flush_media_group(group_id, chat)
+            )
+        self._media_group_buffers[group_id].append(msg)
+
+    async def _flush_media_group(self, group_id: str, chat):
         try:
-            msg = event.message
-            chat = await event.get_chat()
-            sender = await event.get_sender()
+            await asyncio.sleep(MEDIA_GROUP_FLUSH_DELAY)
+            msgs = self._media_group_buffers.pop(group_id, [])
+            self._media_group_tasks.pop(group_id, None)
+            if msgs:
+                await self._enqueue(self._forward_media_group(msgs, chat))
+        except asyncio.CancelledError:
+            pass
 
-            is_channel = isinstance(chat, Channel) and chat.broadcast
-            is_dm = isinstance(chat, User)
-
+    async def _forward_media_group(self, msgs, chat):
+        try:
+            sender = await msgs[0].get_sender()
             sender_name = _entity_name(sender) if sender else "?"
             chat_name = _entity_name(chat)
+            header = _make_header(chat, sender_name, chat_name)
 
-            if is_dm:
-                header = f"\U0001f4ac ЛС от {sender_name}:"
-            elif is_channel:
-                header = f"\U0001f4e2 Канал [{chat_name}]:"
+            text_parts = []
+            photos = []
+            documents = []
+            for msg in msgs:
+                if msg.text:
+                    text_parts.append(msg.text)
+                if isinstance(msg.media, MessageMediaPhoto):
+                    photos.append(msg)
+                elif isinstance(msg.media, MessageMediaDocument):
+                    doc = msg.media.document
+                    mime = doc.mime_type or ""
+                    if mime.startswith("image"):
+                        photos.append(msg)
+                    else:
+                        documents.append((msg, doc))
+
+            full_text = f"{header}\n" + "\n".join(text_parts) if text_parts else header
+
+            if photos:
+                caption = full_text
+                for i, photo_msg in enumerate(photos):
+                    photo_bytes = await self.tg.download_media(photo_msg)
+                    if photo_bytes:
+                        if i == 0:
+                            vk_id = await self.vk.send_photo(photo_bytes, caption)
+                        else:
+                            vk_id = await self.vk.send_photo(photo_bytes)
+                        if i == 0 and vk_id:
+                            chat_id = chat.id if hasattr(chat, "id") else 0
+                            await save_mapping(
+                                vk_msg_id=vk_id,
+                                tg_chat_id=chat_id,
+                                tg_msg_id=photo_msg.id,
+                                tg_username=_entity_username(chat),
+                                is_channel=isinstance(chat, Channel) and chat.broadcast,
+                            )
+            elif documents:
+                await self.vk.send_message(f"{full_text}\n[альбом: {len(documents)} файлов]")
             else:
-                header = f"\U0001f465 [{chat_name}] {sender_name}:"
+                await self.vk.send_message(full_text)
+        except Exception as e:
+            logger.error("Error forwarding media group: %s", e, exc_info=True)
+
+    async def _forward_single(self, msg, chat):
+        try:
+            sender = await msg.get_sender()
+            sender_name = _entity_name(sender) if sender else "?"
+            chat_name = _entity_name(chat)
+            header = _make_header(chat, sender_name, chat_name)
 
             text = msg.text or ""
             full_text = f"{header}\n{text}" if text else header
 
-            vk_msg_id = 0
-            if isinstance(msg.media, MessageMediaPhoto):
-                photo_bytes = await self.tg.download_media(msg)
-                vk_msg_id = await self.vk.send_photo(photo_bytes, full_text)
-
-            elif isinstance(msg.media, MessageMediaDocument):
-                doc = msg.media.document
-                mime = doc.mime_type or ""
-                if mime.startswith("video"):
-                    vk_msg_id = await self.vk.send_message(
-                        f"{full_text}\n[видео, {_size_str(doc.size)}]"
-                    )
-                elif mime.startswith("image"):
-                    photo_bytes = await self.tg.download_media(msg)
-                    vk_msg_id = await self.vk.send_photo(photo_bytes, full_text)
-                else:
-                    fname = _doc_filename(doc)
-                    vk_msg_id = await self.vk.send_message(
-                        f"{full_text}\n[файл: {fname}, {_size_str(doc.size)}]"
-                    )
-            elif isinstance(msg.media, MessageMediaWebPage):
-                vk_msg_id = await self.vk.send_message(full_text)
-            else:
-                if full_text.strip():
-                    vk_msg_id = await self.vk.send_message(full_text)
+            vk_msg_id = await self._send_with_media(msg, full_text)
 
             if vk_msg_id:
                 chat_id = chat.id if hasattr(chat, "id") else 0
+                is_channel = isinstance(chat, Channel) and chat.broadcast
                 await save_mapping(
                     vk_msg_id=vk_msg_id,
                     tg_chat_id=chat_id,
@@ -89,46 +191,113 @@ class Bridge:
                     tg_username=_entity_username(chat),
                     is_channel=is_channel,
                 )
-                logger.info(
-                    "TG->VK: msg %s -> VK msg %s (chat %s)",
-                    msg.id, vk_msg_id, chat_id
-                )
+                logger.info("TG->VK: msg %s -> VK msg %s (chat %s)", msg.id, vk_msg_id, chat_id)
 
-                if is_dm and sender:
+                if isinstance(chat, User) and sender:
                     uname = _entity_username(sender) or str(sender.id)
                     await save_contact(uname, sender_name, sender.id)
 
         except FloodWaitError as e:
-            logger.warning("FloodWait %s sec, retrying...", e.seconds)
-            await asyncio.sleep(e.seconds)
+            logger.warning("FloodWait %s sec, sleeping", e.seconds)
+            await asyncio.sleep(min(e.seconds, 300))
+        except RPCError as e:
+            logger.error("TG RPC error: %s", e)
         except Exception as e:
             logger.error("Error forwarding TG->VK: %s", e, exc_info=True)
+
+    async def _send_with_media(self, msg, full_text: str) -> int:
+        if isinstance(msg.media, MessageMediaPhoto):
+            photo_bytes = await self.tg.download_media(msg)
+            if photo_bytes:
+                return await self.vk.send_photo(photo_bytes, full_text)
+            return await self.vk.send_message(full_text)
+
+        if isinstance(msg.media, MessageMediaDocument):
+            doc = msg.media.document
+            mime = doc.mime_type or ""
+            fname = _doc_filename(doc)
+            size = doc.size or 0
+
+            if mime.startswith("video"):
+                return await self.vk.send_message(
+                    f"{full_text}\n[видео: {fname}, {_size_str(size)}]"
+                )
+            if mime.startswith("image"):
+                photo_bytes = await self.tg.download_media(msg)
+                if photo_bytes:
+                    return await self.vk.send_photo(photo_bytes, full_text)
+                return await self.vk.send_message(full_text)
+
+            if size < cfg.max_media_size_mb * 1024 * 1024:
+                file_bytes = await self.tg.download_media(msg)
+                if file_bytes:
+                    return await self.vk.send_document(file_bytes, fname, f"{full_text}\n[файл: {fname}]")
+            return await self.vk.send_message(
+                f"{full_text}\n[файл: {fname}, {_size_str(size)}]"
+            )
+
+        if isinstance(msg.media, MessageMediaWebPage):
+            return await self.vk.send_message(full_text)
+
+        if isinstance(msg.media, MessageMediaGeo):
+            coords = f"{msg.media.lat}, {msg.media.long}" if hasattr(msg.media, 'lat') else ""
+            return await self.vk.send_message(f"{full_text}\n[геолокация: {coords}]")
+
+        if isinstance(msg.media, MessageMediaPoll):
+            return await self.vk.send_message(f"{full_text}\n[опрос]")
+
+        if full_text.strip():
+            return await self.vk.send_message(full_text)
+
+        return 0
+
+    async def _forward_edit(self, msg, chat):
+        try:
+            chat_id = chat.id if hasattr(chat, "id") else 0
+            row = await get_vk_by_tg(chat_id, msg.id)
+            if not row:
+                return
+
+            vk_msg_id, is_channel = row
+            if is_channel:
+                return
+
+            sender = await msg.get_sender()
+            sender_name = _entity_name(sender) if sender else "?"
+            chat_name = _entity_name(chat)
+            header = _make_header(chat, sender_name, chat_name)
+
+            if msg.text:
+                await self.vk.send_message(
+                    f"{header}\n✏️ (изменено):\n{msg.text}"
+                )
+        except Exception as e:
+            logger.error("Error forwarding edit: %s", e, exc_info=True)
 
     # ------------------------------------------------------------------ #
     #  VK -> Telegram                                                      #
     # ------------------------------------------------------------------ #
 
-    async def _on_vk_reply(self, replied_vk_id: int, text: str,
-                           attachments: list, vk_msg_id: int):
-        """Пользователь ответил в VK на сообщение — отвечаем в TG."""
+    async def _on_vk_reply(self, replied_vk_id: int, text: str, attachments: list, vk_msg_id: int):
         row = await get_tg_by_vk(replied_vk_id)
         if not row:
             logger.warning("Mapping not found for VK msg %s", replied_vk_id)
-            await self.vk.send_message("\u274c Не могу найти оригинальное сообщение в Telegram.")
+            await self.vk.send_message("Не могу найти оригинальное сообщение в Telegram.")
             return
 
         tg_chat_id, tg_msg_id, is_channel = row
 
         if is_channel:
-            await self.vk.send_message("\u274c Нельзя ответить в канал.")
+            await self.vk.send_message("Нельзя ответить в канал.")
             return
 
+        await self._enqueue(self._send_reply(tg_chat_id, tg_msg_id, text, attachments, vk_msg_id))
+
+    async def _send_reply(self, tg_chat_id: int, tg_msg_id: int, text: str, attachments: list, vk_msg_id: int):
         try:
-            entity = await self.tg.client.get_entity(tg_chat_id)
-            logger.info(
-                "VK->TG: reply to VK msg %s -> TG chat %s msg %s",
-                replied_vk_id, tg_chat_id, tg_msg_id
-            )
+            await self.vk.set_typing()
+            entity = await self.tg.get_entity(tg_chat_id)
+            logger.info("VK->TG: reply to VK msg %s -> TG chat %s msg %s", vk_msg_id, tg_chat_id, tg_msg_id)
 
             file_to_send = None
             extra_text = ""
@@ -136,16 +305,8 @@ class Bridge:
             for att in attachments:
                 att_type = att.get("type")
                 if att_type == "photo":
-                    photo = att["photo"]
-                    sizes = photo.get("sizes", [])
-                    if sizes:
-                        best = max(sizes, key=lambda s: s.get("width", 0))
-                        url = best.get("url")
-                        if url:
-                            async with aiohttp.ClientSession() as s:
-                                async with s.get(url) as r:
-                                    file_to_send = io.BytesIO(await r.read())
-                                    file_to_send.name = "photo.jpg"
+                    file_to_send, extra = await self._download_vk_photo(att)
+                    extra_text += extra
                 elif att_type == "video":
                     v = att["video"]
                     extra_text += f"\n[видео: {v.get('title', '')}]"
@@ -155,6 +316,13 @@ class Bridge:
                     extra_text += f"\n[файл: {d.get('title', '')}] {url}"
                 elif att_type == "sticker":
                     extra_text += "\n[стикер]"
+                elif att_type == "audio":
+                    a = att.get("audio", {})
+                    extra_text += f"\n[аудио: {a.get('artist', '')} - {a.get('title', '')}]"
+                elif att_type == "wall":
+                    extra_text += "\n[запись со стены]"
+                elif att_type == "link":
+                    extra_text += f"\n{att.get('link', {}).get('url', '')}"
 
             send_text = text + extra_text if (text or extra_text) else None
 
@@ -164,30 +332,88 @@ class Bridge:
                 reply_to=tg_msg_id,
                 file=file_to_send,
             )
-            await self.vk.send_message("\u2705 Отправлено в Telegram.")
+            await self.vk.send_message("Отправлено в Telegram.")
 
         except FloodWaitError as e:
             logger.warning("FloodWait %s sec in VK->TG reply", e.seconds)
-            await asyncio.sleep(e.seconds)
+            await asyncio.sleep(min(e.seconds, 300))
+        except RPCError as e:
+            logger.error("TG RPC error in VK->TG: %s", e)
+            await self.vk.send_message(f"Ошибка Telegram: {e}")
         except Exception as e:
             logger.error("Error forwarding VK->TG: %s", e, exc_info=True)
-            await self.vk.send_message(f"\u274c Ошибка: {e}")
+            await self.vk.send_message(f"Ошибка: {e}")
+
+    async def _download_vk_photo(self, att: dict) -> tuple:
+        photo = att.get("photo", {})
+        sizes = photo.get("sizes", [])
+        if sizes:
+            best = max(sizes, key=lambda s: s.get("width", 0))
+            url = best.get("url")
+            if url:
+                try:
+                    async with aiohttp.ClientSession() as s:
+                        async with s.get(url, timeout=aiohttp.ClientTimeout(total=30)) as r:
+                            buf = io.BytesIO(await r.read())
+                            buf.name = "photo.jpg"
+                            return buf, ""
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    logger.error("Failed to download VK photo: %s", e)
+        return None, "\n[фото]"
+
+    # ------------------------------------------------------------------ #
+    #  VK Commands                                                         #
+    # ------------------------------------------------------------------ #
 
     async def _on_vk_command(self, cmd: str, args: str, vk_msg_id: int):
-        """Команды от пользователя в VK."""
         if cmd == "/send":
             await self._cmd_send(args, vk_msg_id)
         elif cmd in ("/contacts", "/contact"):
             await self._cmd_contacts()
+        elif cmd == "/help":
+            await self._cmd_help()
+        elif cmd == "/status":
+            await self._cmd_status()
+        elif cmd == "/chats":
+            await self._cmd_chats()
+        elif cmd == "/ping":
+            await self.vk.send_message("pong")
         else:
-            await self.vk.send_message(
-                "Доступные команды:\n"
-                "/send @username текст — написать в TG\n"
-                "/contacts — список контактов"
-            )
+            await self._cmd_help()
+
+    async def _cmd_help(self):
+        await self.vk.send_message(
+            "Доступные команды:\n"
+            "/send @username текст — написать в TG\n"
+            "/contacts — список контактов\n"
+            "/chats — список последних чатов\n"
+            "/status — статус бота\n"
+            "/ping — проверка связи\n"
+            "/help — эта справка\n\n"
+            "Чтобы ответить в TG, используй reply на сообщение."
+        )
+
+    async def _cmd_status(self):
+        await self.vk.send_message(
+            "Статус: работает\n"
+            f"TG: {cfg.tg_session}\n"
+            f"VK: группа {cfg.vk_group_id}\n"
+            f"Очередь: {self._queue.qsize()}/{self._queue.maxsize}"
+        )
+
+    async def _cmd_chats(self):
+        try:
+            dialogs = await self.tg.get_dialogs(limit=15)
+            lines = ["Последние чаты:"]
+            for d in dialogs:
+                name = d.name or "?"
+                chat_id = d.entity.id if hasattr(d.entity, "id") else "?"
+                lines.append(f"• {name} (id: {chat_id})")
+            await self.vk.send_message("\n".join(lines))
+        except Exception as e:
+            await self.vk.send_message(f"Ошибка: {e}")
 
     async def _cmd_send(self, args: str, vk_msg_id: int):
-        """Отправить сообщение в TG: /send @username текст."""
         parts = args.split(maxsplit=1)
         if not parts:
             await self.vk.send_message("Использование: /send @username текст")
@@ -204,9 +430,7 @@ class Bridge:
             entity = await self.tg.get_entity(username)
             sent = await self.tg.send_message(entity, text)
 
-            vk_sent_id = await self.vk.send_message(
-                f"\u2705 Отправлено @{username}:\n{text}"
-            )
+            vk_sent_id = await self.vk.send_message(f"Отправлено @{username}:\n{text}")
             if vk_sent_id:
                 await save_mapping(
                     vk_msg_id=vk_sent_id,
@@ -218,24 +442,33 @@ class Bridge:
             await save_contact(username, _entity_name(entity), entity.id)
 
         except Exception as e:
-            await self.vk.send_message(f"\u274c Ошибка: {e}")
+            await self.vk.send_message(f"Ошибка: {e}")
 
     async def _cmd_contacts(self):
-        """Список сохранённых контактов."""
         contacts = await get_contacts()
         if not contacts:
-            await self.vk.send_message("Контактов пока нет. Они появятся после первого ЛС.")
+            await self.vk.send_message(
+                "Контактов пока нет. Они появятся после первого ЛС."
+            )
             return
 
-        lines = ["\U0001f4cb Контакты:"]
+        lines = ["Контакты:"]
         for username, display, tg_id in contacts:
-            lines.append(f"\u2022 {display} (@{username})")
+            lines.append(f"• {display} (@{username})")
         await self.vk.send_message("\n".join(lines))
+
+    async def shutdown(self):
+        for task in self._media_group_tasks.values():
+            task.cancel()
+        if self._main_task:
+            self._main_task.cancel()
+        await close_db()
 
 
 # ------------------------------------------------------------------ #
 #  Helpers                                                             #
 # ------------------------------------------------------------------ #
+
 
 def _entity_name(entity) -> str:
     if hasattr(entity, "first_name"):
@@ -262,4 +495,17 @@ def _size_str(size: int) -> str:
         return f"{size}B"
     if size < 1024 ** 2:
         return f"{size // 1024}KB"
-    return f"{size // 1024 ** 2}MB"
+    if size < 1024 ** 3:
+        return f"{size // 1024 ** 2}MB"
+    return f"{size // 1024 ** 3}GB"
+
+
+def _make_header(chat, sender_name: str, chat_name: str) -> str:
+    is_channel = isinstance(chat, Channel) and chat.broadcast
+    is_dm = isinstance(chat, User)
+
+    if is_dm:
+        return f"\U0001f4ac ЛС от {sender_name}:"
+    if is_channel:
+        return f"\U0001f4e2 Канал [{chat_name}]:"
+    return f"\U0001f465 [{chat_name}] {sender_name}:"

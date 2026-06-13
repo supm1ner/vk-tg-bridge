@@ -1,0 +1,12 @@
+services:
+  bridge:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    environment:
+      - DB_PATH=/app/data/bridge.db
+      - TG_SESSION=/app/data/bridge_session
+      - LOG_FILE=/app/data/bridge.log

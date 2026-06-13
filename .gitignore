@@ -1,6 +1,8 @@
 .env
-venv/
+bridge.db
+bridge_session.session
+data/
 __pycache__/
-*.session
-*.db
 *.pyc
+venv/
+*.log

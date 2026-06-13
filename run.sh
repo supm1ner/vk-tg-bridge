@@ -1,18 +1,21 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+cd "$(dirname "$0")"
 
-# Создаём venv если нет
-if [ ! -d "venv" ]; then
-    echo "Creating virtual environment..."
-    python3 -m venv venv
+if [ ! -f .env ]; then
+    cp .env.example .env
+    echo ".env created from .env.example — edit it with your credentials"
+    exit 1
 fi
 
-# Активируем и устанавливаем зависимости
-source venv/bin/activate
-pip install --quiet -r requirements.txt
+if [ ! -d venv ]; then
+    python3 -m venv venv
+    source venv/bin/activate
+    pip install -U pip
+    pip install -r requirements.txt
+else
+    source venv/bin/activate
+fi
 
-# Запускаем
-python main.py
+exec python main.py
